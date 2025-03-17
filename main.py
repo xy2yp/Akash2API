@@ -474,4 +474,4 @@ async def process_image_generation(msg_data: str, session: requests.Session, hea
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app, host='0.0.0.0', port=7860)
+    uvicorn.run(app, host='0.0.0.0', port=9000)
