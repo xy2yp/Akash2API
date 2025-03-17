@@ -192,32 +192,22 @@ async def chat_completions(
                             if data.get('model') == 'AkashGen' and "<image_generation>" in msg_data:
                                 # 图片生成模型的特殊处理
                                 async def process_and_send():
-                                    end_msg = await process_image_generation(msg_data, session, headers, chat_id)
-                                    if end_msg:
-                                        chunk = {
-                                            "id": f"chatcmpl-{chat_id}",
-                                            "object": "chat.completion.chunk",
-                                            "created": int(time.time()),
-                                            "model": data.get('model'),
-                                            "choices": [{
-                                                "delta": {"content": end_msg},
-                                                "index": 0,
-                                                "finish_reason": None
-                                            }]
-                                        }
-                                        return f"data: {json.dumps(chunk)}\n\n"
+                                    messages = await process_image_generation(msg_data, session, headers, chat_id)
+                                    if messages:
+                                        return messages
                                     return None
 
                                 # 创建新的事件循环
                                 loop = asyncio.new_event_loop()
                                 asyncio.set_event_loop(loop)
                                 try:
-                                    result = loop.run_until_complete(process_and_send())
+                                    result_messages = loop.run_until_complete(process_and_send())
                                 finally:
                                     loop.close()
                                 
-                                if result:
-                                    yield result
+                                if result_messages:
+                                    for message in result_messages:
+                                        yield f"data: {json.dumps(message)}\n\n"
                                 continue
                             
                             content_buffer += msg_data
@@ -410,34 +400,77 @@ async def upload_to_xinyew(image_base64: str, job_id: str) -> Optional[str]:
         print(traceback.format_exc())
         return None
 
-async def process_image_generation(msg_data: str, session: requests.Session, headers: dict, chat_id: str) -> str:
-    """处理图片生成的逻辑"""
+async def process_image_generation(msg_data: str, session: requests.Session, headers: dict, chat_id: str) -> Optional[list]:
+    """处理图片生成的逻辑，返回多个消息块"""
     match = re.search(r"jobId='([^']+)' prompt='([^']+)' negative='([^']*)'", msg_data)
     if match:
         job_id, prompt, negative = match.groups()
         print(f"Starting image generation process for job_id: {job_id}")
         
-        # 发送思考开始的消息
+        # 记录开始时间
         start_time = time.time()
-        end_msg = "<think>\n"
-        end_msg += "🎨 Generating image...\n\n"
-        end_msg += f"Prompt: {prompt}\n"
+        
+        # 发送思考开始的消息
+        think_msg = "<think>\n"
+        think_msg += "🎨 Generating image...\n\n"
+        think_msg += f"Prompt: {prompt}\n"
         
         # 检查图片状态和上传
         result = await check_image_status(session, job_id, headers)
         
-        # 发送结束消息
+        # 计算实际花费的时间
         elapsed_time = time.time() - start_time
-        end_msg += f"\n🤔 Thinking for {elapsed_time:.1f}s...\n"
-        end_msg += "</think>\n\n"
         
-        if result:  # result 现在是上传后的图片URL
-            end_msg += f"![Generated Image]({result})"
+        # 完成思考部分
+        think_msg += f"\n🤔 Thinking for {elapsed_time:.1f}s...\n"
+        think_msg += "</think>"
+        
+        # 返回两个独立的消息块
+        messages = []
+        
+        # 第一个消息块：思考过程
+        messages.append({
+            "id": f"chatcmpl-{chat_id}-think",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "AkashGen",
+            "choices": [{
+                "delta": {"content": think_msg},
+                "index": 0,
+                "finish_reason": None
+            }]
+        })
+        
+        # 第二个消息块：图片结果
+        if result:
+            image_msg = f"\n\n![Generated Image]({result})"
+            messages.append({
+                "id": f"chatcmpl-{chat_id}-image",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": "AkashGen",
+                "choices": [{
+                    "delta": {"content": image_msg},
+                    "index": 0,
+                    "finish_reason": None
+                }]
+            })
         else:
-            end_msg += "*Image generation or upload failed.*\n"
-            
-        return end_msg
-    return ""
+            fail_msg = "\n\n*Image generation or upload failed.*"
+            messages.append({
+                "id": f"chatcmpl-{chat_id}-fail",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": "AkashGen",
+                "choices": [{
+                    "delta": {"content": fail_msg},
+                    "index": 0,
+                    "finish_reason": None
+                }]
+            })
+        
+        return messages
+    return None
 
 if __name__ == '__main__':
     import uvicorn
