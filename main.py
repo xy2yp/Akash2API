@@ -230,7 +230,7 @@ async def chat_completions(
                                 "id": f"chatcmpl-{chat_id}",
                                 "object": "chat.completion.chunk",
                                 "created": int(time.time()),
-                                "model": data.get('model'),  # 使用请求中指定的模型 
+                                "model": data.get('model'),  # 使用请求中指定的模型
                                 "choices": [{
                                     "delta": {},
                                     "index": 0,
