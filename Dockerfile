@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM mcr.microsoft.com/playwright/python:v1.51.0-noble
 
 # 设置工作目录
 WORKDIR /app
