@@ -25,7 +25,7 @@ load_dotenv(override=True)
 
 # 配置日志
 logging.basicConfig(
-    level=logging.INFO,  # 改为 INFO 级别
+    level=logging.DEBUG,  # 改为 DEBUG 级别
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -35,7 +35,8 @@ global_data = {
     "cookie": None,
     "cookies": None,
     "last_update": 0,
-    "cookie_expires": 0  # 添加 cookie 过期时间
+    "cookie_expires": 0,  # 添加 cookie 过期时间
+    "is_refreshing": False  # 添加刷新状态标志
 }
 
 @asynccontextmanager
@@ -48,7 +49,12 @@ async def lifespan(app: FastAPI):
     cookie_thread.daemon = True  # 设置为守护线程
     cookie_thread.start()
     
-    logger.info("Cookie fetcher thread started")
+    # 创建并启动自动刷新线程
+    refresh_thread = threading.Thread(target=auto_refresh_cookie)
+    refresh_thread.daemon = True
+    refresh_thread.start()
+    
+    logger.info("Cookie fetcher and auto-refresh threads started")
     yield
     
     # 关闭时清理资源
@@ -56,6 +62,7 @@ async def lifespan(app: FastAPI):
     global_data["cookie"] = None
     global_data["cookies"] = None
     global_data["last_update"] = 0
+    global_data["is_refreshing"] = False
 
 def get_cookie_with_retry(max_retries=3, retry_delay=5):
     """带重试机制的获取 cookie 函数"""
@@ -81,7 +88,7 @@ security = HTTPBearer()
 # OpenAI API Key 配置，可以通过环境变量覆盖
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)
 logger.info(f"OPENAI_API_KEY is set: {OPENAI_API_KEY is not None}")
-logger.info(f"OPENAI_API_KEY value: {OPENAI_API_KEY}")
+# logger.info(f"OPENAI_API_KEY value: {OPENAI_API_KEY}")
 
 def get_cookie():
     """获取 cookie 的函数"""
@@ -116,16 +123,16 @@ def get_cookie():
                 logger.info("Creating browser context...")
                 context = browser.new_context(
                     viewport={'width': 1920, 'height': 1080},
-                    user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.95 Safari/537.36',
                     locale='en-US',
                     timezone_id='America/New_York',
                     permissions=['geolocation'],
                     extra_http_headers={
                         'Accept-Language': 'en-US,en;q=0.9',
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                        'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                        'Sec-Ch-Ua': '"Not_A Brand";v="24", "Chromium";v="122", "Google Chrome";v="122"',
                         'Sec-Ch-Ua-Mobile': '?0',
-                        'Sec-Ch-Ua-Platform': '"macOS"',
+                        'Sec-Ch-Ua-Platform': '"Windows"',
                         'Sec-Fetch-Dest': 'document',
                         'Sec-Fetch-Mode': 'navigate',
                         'Sec-Fetch-Site': 'none',
@@ -157,7 +164,7 @@ def get_cookie():
                     
                     # 等待一段时间，让 Cloudflare 检查完成
                     logger.info("Waiting for Cloudflare check...")
-                    time.sleep(5)
+                    time.sleep(3)
                     
                     # 尝试点击页面，模拟用户行为
                     try:
@@ -168,7 +175,7 @@ def get_cookie():
                         logger.warning(f"Failed to simulate user interaction: {e}")
                     
                     # 再次等待一段时间
-                    time.sleep(5)
+                    time.sleep(3)
                     
                 except Exception as e:
                     logger.warning(f"Timeout waiting for load state: {e}")
@@ -226,15 +233,67 @@ def get_cookie():
         logger.error(f"Error type: {type(e)}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
-        return None
+    return None
 
 # 添加刷新 cookie 的函数
 async def refresh_cookie():
+    """刷新 cookie 的函数，用于401错误触发"""
     logger.info("Refreshing cookie due to 401 error")
-    # 标记 cookie 为过期
-    global_data["cookie_expires"] = 0
-    # 获取新的 cookie
-    return get_cookie()
+    
+    # 如果已经在刷新中，等待一段时间
+    if global_data["is_refreshing"]:
+        logger.info("Cookie refresh already in progress, waiting...")
+        # 等待最多10秒
+        for _ in range(10):
+            await asyncio.sleep(1)
+            if not global_data["is_refreshing"]:
+                break
+    
+    # 如果仍然在刷新中，强制刷新
+    if global_data["is_refreshing"]:
+        logger.info("Forcing cookie refresh due to 401 error")
+        global_data["is_refreshing"] = False
+    
+    try:
+        global_data["is_refreshing"] = True
+        # 标记 cookie 为过期
+        global_data["cookie_expires"] = 0
+        # 获取新的 cookie
+        new_cookie = get_cookie()
+        return new_cookie
+    finally:
+        global_data["is_refreshing"] = False
+
+async def background_refresh_cookie():
+    """后台刷新 cookie 的函数，不影响接口调用"""
+    if global_data["is_refreshing"]:
+        logger.info("Cookie refresh already in progress, skipping")
+        return
+    
+    try:
+        global_data["is_refreshing"] = True
+        logger.info("Starting background cookie refresh")
+        new_cookie = get_cookie()
+        if new_cookie:
+            logger.info("Background cookie refresh successful")
+            # 更新 cookie 和过期时间
+            global_data["cookie"] = new_cookie
+            global_data["last_update"] = time.time()
+            # 查找 session_token cookie 的过期时间
+            session_cookie = next((cookie for cookie in global_data["cookies"] if cookie['name'] == 'session_token'), None)
+            if session_cookie and 'expires' in session_cookie and session_cookie['expires'] > 0:
+                global_data["cookie_expires"] = session_cookie['expires']
+                logger.info(f"Session token expires at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(session_cookie['expires']))}")
+            else:
+                # 如果没有明确的过期时间，默认设置为1小时后过期
+                global_data["cookie_expires"] = time.time() + 3600
+                logger.info("No explicit expiration in session_token cookie, setting default 1 hour expiration")
+        else:
+            logger.error("Background cookie refresh failed")
+    except Exception as e:
+        logger.error(f"Error in background cookie refresh: {e}")
+    finally:
+        global_data["is_refreshing"] = False
 
 async def check_and_update_cookie(background_tasks: BackgroundTasks):
     # 如果 cookie 不存在或已过期，则更新
@@ -244,16 +303,20 @@ async def check_and_update_cookie(background_tasks: BackgroundTasks):
         background_tasks.add_task(get_cookie)
     else:
         logger.info("Using existing cookie")
+        # 检查是否需要提前刷新（过期前一分钟）
+        if global_data["cookie_expires"] - current_time < 60 and not global_data["is_refreshing"]:
+            logger.info("Cookie will expire in less than 1 minute, scheduling background refresh")
+            background_tasks.add_task(background_refresh_cookie)
 
 async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
-    logger.info(f"Received token: {token}")
+    # logger.info(f"Received token: {token}")
     
     # 如果设置了 OPENAI_API_KEY，则需要验证
     if OPENAI_API_KEY is not None:
         # 去掉 Bearer 前缀后再比较
         clean_token = token.replace("Bearer ", "") if token.startswith("Bearer ") else token
-        logger.info(f"Clean token: {clean_token}")
+        # logger.info(f"Clean token: {clean_token}")
         if clean_token != OPENAI_API_KEY:
             logger.error(f"Token mismatch. Expected: {OPENAI_API_KEY}, Got: {clean_token}")
             raise HTTPException(
@@ -332,7 +395,7 @@ async def check_image_status(session: requests.Session, job_id: str, headers: di
     print(f"Timeout waiting for job {job_id}")
     return None
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 async def health_check():
     """健康检查端点，返回服务状态"""
     # 检查 cookie 状态
@@ -400,6 +463,12 @@ async def health_check():
         <title>Akash API 服务状态</title>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <script>
+            // 每30秒自动刷新页面
+            setTimeout(function() {{
+                location.reload();
+            }}, 30000);
+        </script>
         <style>
             body {{
                 font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -618,6 +687,45 @@ async def health_check():
                 border-radius: 3px;
                 font-family: monospace;
             }}
+            .contact-info {{
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 15px;
+                margin: 15px 0;
+            }}
+            .contact-avatar {{
+                width: 40px;
+                height: 40px;
+                border-radius: 50%;
+                object-fit: cover;
+                border: 2px solid #eee;
+            }}
+            .contact-logo {{
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }}
+            .contact-name {{
+                font-weight: 600;
+                color: #3498db;
+                transition: color 0.3s;
+                text-decoration: none;
+            }}
+            .contact-name:hover {{
+                color: #2980b9;
+                text-decoration: underline;
+            }}
+            .contact-email {{
+                color: #666;
+                font-size: 14px;
+                text-decoration: none;
+                transition: color 0.3s;
+            }}
+            .contact-email:hover {{
+                color: #3498db;
+                text-decoration: underline;
+            }}
         </style>
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
     </head>
@@ -651,6 +759,12 @@ async def health_check():
             
             <div class="footer">
                 <p>Akash API 服务 - 健康检查页面</p>
+                <div class="contact-info">
+                    <img src="https://gravatar.loli.net/avatar/91af699fa609b1b7730753f1ff96b835?s=50&d=retro" class="contact-avatar" alt="用户头像" />
+                    <div>
+                        <p>如遇服务异常，请及时联系：<a href="https://linux.do/u/hzruo" class="contact-name">云胡不喜</a></p>
+                    </div>
+                </div>
                 <p>当前时间: {current_time.strftime("%Y-%m-%d %H:%M:%S")} (北京时间)</p>
             </div>
         </div>
@@ -905,19 +1019,34 @@ async def list_models(
 
 async def process_image_generation(msg_data: str, session: requests.Session, headers: dict, chat_id: str) -> Optional[list]:
     """处理图片生成的逻辑，返回多个消息块"""
+    # 检查消息中是否包含jobId
+    if "jobId='undefined'" in msg_data or "jobId=''" in msg_data:
+        logger.error("Image generation failed: jobId is undefined or empty")
+        return create_error_messages(chat_id, "Akash官网服务异常，无法生成图片,请稍后再试。")
+        
     match = re.search(r"jobId='([^']+)' prompt='([^']+)' negative='([^']*)'", msg_data)
-    if match:
-        job_id, prompt, negative = match.groups()
-        print(f"Starting image generation process for job_id: {job_id}")
+    if not match:
+        logger.error(f"Failed to extract job_id from message: {msg_data[:100]}...")
+        return create_error_messages(chat_id, "无法解析图片生成任务。请稍后再试。")
         
-        # 记录开始时间
-        start_time = time.time()
-        
-        # 发送思考开始的消息
-        think_msg = "<think>\n"
-        think_msg += "🎨 Generating image...\n\n"
-        think_msg += f"Prompt: {prompt}\n"
-        
+    job_id, prompt, negative = match.groups()
+    
+    # 检查job_id是否有效
+    if not job_id or job_id == 'undefined' or job_id == 'null':
+        logger.error(f"Invalid job_id: {job_id}")
+        return create_error_messages(chat_id, "Akash服务异常，无法获取有效的任务ID。请稍后再试。")
+    
+    print(f"Starting image generation process for job_id: {job_id}")
+    
+    # 记录开始时间
+    start_time = time.time()
+    
+    # 发送思考开始的消息
+    think_msg = "<think>\n"
+    think_msg += "🎨 Generating image...\n\n"
+    think_msg += f"Prompt: {prompt}\n"
+    
+    try:
         # 检查图片状态和上传
         result = await check_image_status(session, job_id, headers)
         
@@ -973,7 +1102,25 @@ async def process_image_generation(msg_data: str, session: requests.Session, hea
             })
         
         return messages
-    return None
+    except Exception as e:
+        logger.error(f"Error in image generation process: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return create_error_messages(chat_id, "图片生成过程中发生错误。请稍后再试。")
+
+def create_error_messages(chat_id: str, error_message: str) -> list:
+    """创建错误消息块"""
+    return [{
+        "id": f"chatcmpl-{chat_id}-error",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": "AkashGen",
+        "choices": [{
+            "delta": {"content": f"\n\n**❌ {error_message}**"},
+            "index": 0,
+            "finish_reason": None
+        }]
+    }]
 
 async def upload_to_xinyew(image_base64: str, job_id: str) -> Optional[str]:
     """上传图片到新野图床并返回URL"""
@@ -1041,6 +1188,28 @@ async def upload_to_xinyew(image_base64: str, job_id: str) -> Optional[str]:
         import traceback
         print(traceback.format_exc())
         return None
+
+def auto_refresh_cookie():
+    """自动刷新 cookie 的线程函数"""
+    while True:
+        try:
+            current_time = time.time()
+            # 如果 cookie 存在且将在1分钟内过期，且当前没有刷新操作在进行
+            if (global_data["cookie"] and 
+                global_data["cookie_expires"] - current_time < 60 and 
+                not global_data["is_refreshing"]):
+                logger.info("Cookie will expire in less than 1 minute, starting auto-refresh")
+                try:
+                    global_data["is_refreshing"] = True
+                    get_cookie_with_retry()
+                finally:
+                    global_data["is_refreshing"] = False
+            # 每30秒检查一次
+            time.sleep(30)
+        except Exception as e:
+            logger.error(f"Error in auto-refresh thread: {e}")
+            global_data["is_refreshing"] = False  # 确保出错时也重置标志
+            time.sleep(30)  # 出错后等待30秒再继续
 
 if __name__ == '__main__':
     import uvicorn
